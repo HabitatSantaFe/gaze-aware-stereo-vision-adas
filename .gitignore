@@ -1,0 +1,34 @@
+# Modelos y pesos externos
+*.pt
+*.pth
+*.blob
+*.onnx
+*.engine
+
+# Datos y salidas experimentales
+outputs/
+capturas_testing/
+dataset_adas/
+datasets/
+runs/
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.csv
+*.jsonl
+
+# Entornos y cachés
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.cache/
+
+# Editores y sistema operativo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

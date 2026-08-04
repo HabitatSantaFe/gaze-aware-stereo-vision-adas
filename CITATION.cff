@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated article."
+title: "Gaze-Aware Stereo Vision ADAS"
+type: software
+authors:
+  - family-names: "Resendiz-Jurado"
+    given-names: "Claudia"
+  - family-names: "Terven"
+    given-names: "Juan"
+  - family-names: "Chavez-Urbiola"
+    given-names: "Edgar Arturo"
+  - family-names: "Córdova-Esparza"
+    given-names: "Diana Margarita"
+  - family-names: "Romero-Gonzalez"
+    given-names: "Julio Alejandro"
+  - family-names: "Alfonso-Francia"
+    given-names: "Gendry"
+date-released: 2026-08-04
+license: AGPL-3.0-only

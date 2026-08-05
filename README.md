@@ -86,10 +86,4 @@ particular, el sistema completo con un checkpoint derivado de ETH-XGaze queda
 limitado a investigación académica no comercial y dicho checkpoint no puede
 redistribuirse.
 
-El manuscrito no está incluido en esta carpeta ni queda cubierto por la licencia
-del código. Consulta `docs/README.md` antes de añadirlo: deben verificarse la
-autorización de los coautores, la política editorial, la privacidad de las
-figuras y las declaraciones éticas aplicables. Actualiza también los datos
-bibliográficos si existe DOI.
 
-Antes de publicar, revisa también el historial de Git y añade la cita definitiva del paper.

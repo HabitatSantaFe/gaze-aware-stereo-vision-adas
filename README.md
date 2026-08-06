@@ -49,26 +49,6 @@ python adas_gaze_realtime.py --lr-device-id MXID_1 --pro-device-id MXID_2
 
 Las salidas opcionales se habilitan con `--save-reports`, `--record-video`, `--save-captures` y `--save-dataset-frames`, y se escriben en `outputs/`.
 
-## Sincronización temporal
-
-Las dos OAK-D se emparejan por software usando `getTimestamp()`, cuyo reloj de
-dispositivo es alineado por DepthAI al reloj monotónico del host. El programa
-mantiene buffers independientes y selecciona el par LR/Pro con la menor
-diferencia absoluta. Por defecto sólo acepta pares con un desfase máximo de
-20 ms, descarta el mensaje más antiguo cuando no encuentra una pareja válida y
-no reutiliza ni duplica frames.
-
-La profundidad LR se empareja con el timestamp RGB LR; la profundidad y la
-detección facial Pro se emparejan con el timestamp RGB Pro. Un auxiliar que no
-llega dentro de 100 ms o excede el umbral no se sustituye por datos antiguos.
-Los umbrales se configuran con `--sync-tolerance-ms`, `--sync-buffer-size` y
-`--aux-sync-wait-ms`. El reporte JSON incluye desfase medio, máximo y p95,
-mensajes descartados, huecos de secuencia y latencia desde captura hasta
-decisión. No se aplica extrapolación temporal de mirada u objetos.
-
-La formulación destinada a la sección metodológica está en
-`docs/TEMPORAL_SYNCHRONIZATION.md`.
-
 ## Pesos
 
 Este repositorio no redistribuye pesos mediante Git, Releases, LFS u otro

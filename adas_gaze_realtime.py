@@ -157,36 +157,13 @@ class GazeAwareADAS:
         self.next_track_id = 0
         self.ttc_threshold = 2.0  # seconds
         self.depth_history_length = 5
+        self.previous_frame_input_time = None
+
         # Accumulated session counters for reports
         self.moving_frames_count = 0
         self.total_detections_while_moving = 0
         self.ttc_positive_records = 0
         self.unattended_ttc_positive_records = 0
-
-        # Software synchronization across the two independent OAK-D devices.
-        self.sync_tolerance_s = float(args.sync_tolerance_ms) / 1000.0
-        self.aux_sync_wait_s = float(args.aux_sync_wait_ms) / 1000.0
-        self.sync_buffer_size = int(args.sync_buffer_size)
-        self.lr_sync_buffer = deque(maxlen=self.sync_buffer_size)
-        self.pro_sync_buffer = deque(maxlen=self.sync_buffer_size)
-        self.lr_depth_sync_buffer = deque(maxlen=self.sync_buffer_size)
-        self.pro_depth_sync_buffer = deque(maxlen=self.sync_buffer_size)
-        self.face_sync_buffer = deque(maxlen=self.sync_buffer_size)
-        self.sync_pair_deltas_ms = []
-        self.sync_pairs_accepted = 0
-        self.sync_dropped_lr = 0
-        self.sync_dropped_pro = 0
-        self.sync_aux_matched = defaultdict(int)
-        self.sync_aux_missing = defaultdict(int)
-        self.sync_aux_dropped = defaultdict(int)
-        self.stream_messages_received = defaultdict(int)
-        self.stream_sequence_gaps = defaultdict(int)
-        self.stream_last_sequence = {}
-        self.current_sync_delta_ms = None
-        self.current_lr_timestamp_s = None
-        self.current_pro_timestamp_s = None
-        self.current_pair_capture_ts_s = None
-        self.capture_to_decision_latencies_ms = []
         
         # Initial frame counts
         self.current_counts = {
@@ -361,8 +338,8 @@ class GazeAwareADAS:
             )
         except Exception as exc:
             print(f"Advertencia: se usarán intrínsecos del archivo de calibración: {exc}")
-        self.lr_queue = self.device_lr.getOutputQueue("lr", self.sync_buffer_size, False)
-        self.depth_queue = self.device_lr.getOutputQueue("depth", self.sync_buffer_size, False)
+        self.lr_queue = self.device_lr.getOutputQueue("lr", 4, False)
+        self.depth_queue = self.device_lr.getOutputQueue("depth", 4, False)
         
         # Initialize Pro device (driver camera)
         self.device_pro = dai.Device(device_pro)
@@ -435,9 +412,9 @@ class GazeAwareADAS:
             )
         except Exception as exc:
             print(f"Advertencia: se usarán intrínsecos aproximados para la cámara interior: {exc}")
-        self.pro_queue = self.device_pro.getOutputQueue("pro", self.sync_buffer_size, False)
-        self.face_queue = self.device_pro.getOutputQueue("face_detections", self.sync_buffer_size, False)
-        self.pro_depth_queue = self.device_pro.getOutputQueue("pro_depth", self.sync_buffer_size, False)
+        self.pro_queue = self.device_pro.getOutputQueue("pro", 4, False)
+        self.face_queue = self.device_pro.getOutputQueue("face_detections", 4, False)
+        self.pro_depth_queue = self.device_pro.getOutputQueue("pro_depth", 4, False)
         self.landmark_input_queue = self.device_pro.getInputQueue("landmark_in")
         self.landmark_output_queue = self.device_pro.getOutputQueue("landmark_out", 2, True)
         
@@ -1020,140 +997,6 @@ class GazeAwareADAS:
         except Exception:
             return time.perf_counter()
 
-    def _host_clock_seconds(self):
-        """Read the host monotonic clock used by DepthAI's synchronized timestamps."""
-        try:
-            now = dai.Clock.now()
-            if hasattr(now, 'total_seconds'):
-                return now.total_seconds()
-            return float(now)
-        except Exception:
-            return time.perf_counter()
-
-    def _capture_to_now_ms(self):
-        if self.current_pair_capture_ts_s is None:
-            return None
-        return max(0.0, (self._host_clock_seconds() - self.current_pair_capture_ts_s) * 1000.0)
-
-    def _record_stream_message(self, stream_name, msg):
-        """Track received messages and sequence gaps without exposing device IDs."""
-        self.stream_messages_received[stream_name] += 1
-        try:
-            sequence = int(msg.getSequenceNum())
-        except Exception:
-            return
-        previous = self.stream_last_sequence.get(stream_name)
-        if previous is not None and sequence > previous + 1:
-            self.stream_sequence_gaps[stream_name] += sequence - previous - 1
-        self.stream_last_sequence[stream_name] = sequence
-
-    def _append_sync_message(self, buffer, stream_name, msg):
-        """Append one message, accounting for eviction from a bounded buffer."""
-        if len(buffer) == buffer.maxlen:
-            buffer.popleft()
-            if stream_name == 'lr':
-                self.sync_dropped_lr += 1
-            elif stream_name == 'pro':
-                self.sync_dropped_pro += 1
-            else:
-                self.sync_aux_dropped[stream_name] += 1
-        self._record_stream_message(stream_name, msg)
-        buffer.append(msg)
-
-    def _drain_queue(self, queue, buffer, stream_name):
-        """Move every currently available message from a DepthAI queue to a buffer."""
-        if queue is None:
-            return
-        while True:
-            msg = queue.tryGet()
-            if msg is None:
-                break
-            self._append_sync_message(buffer, stream_name, msg)
-
-    def _best_primary_pair(self):
-        """Return indices and delta for the closest LR/Pro pair currently buffered."""
-        if not self.lr_sync_buffer or not self.pro_sync_buffer:
-            return None
-        best = None
-        for lr_index, lr_msg in enumerate(self.lr_sync_buffer):
-            lr_ts = self._msg_timestamp_seconds(lr_msg)
-            for pro_index, pro_msg in enumerate(self.pro_sync_buffer):
-                pro_ts = self._msg_timestamp_seconds(pro_msg)
-                delta = abs(lr_ts - pro_ts)
-                if best is None or delta < best[2]:
-                    best = (lr_index, pro_index, delta, lr_ts, pro_ts)
-        return best
-
-    def get_synchronized_primary_pair(self):
-        """Pair LR and Pro frames by closest host-aligned acquisition timestamp."""
-        while True:
-            self._drain_queue(self.lr_queue, self.lr_sync_buffer, 'lr')
-            self._drain_queue(self.pro_queue, self.pro_sync_buffer, 'pro')
-            if not self.lr_sync_buffer:
-                self._append_sync_message(self.lr_sync_buffer, 'lr', self.lr_queue.get())
-            if not self.pro_sync_buffer:
-                self._append_sync_message(self.pro_sync_buffer, 'pro', self.pro_queue.get())
-
-            best = self._best_primary_pair()
-            if best is None:
-                continue
-            lr_index, pro_index, delta_s, lr_ts, pro_ts = best
-            if delta_s <= self.sync_tolerance_s:
-                for _ in range(lr_index):
-                    self.lr_sync_buffer.popleft()
-                    self.sync_dropped_lr += 1
-                for _ in range(pro_index):
-                    self.pro_sync_buffer.popleft()
-                    self.sync_dropped_pro += 1
-                lr_msg = self.lr_sync_buffer.popleft()
-                pro_msg = self.pro_sync_buffer.popleft()
-                self.sync_pairs_accepted += 1
-                self.current_sync_delta_ms = delta_s * 1000.0
-                self.sync_pair_deltas_ms.append(self.current_sync_delta_ms)
-                self.current_lr_timestamp_s = lr_ts
-                self.current_pro_timestamp_s = pro_ts
-                self.current_pair_capture_ts_s = max(lr_ts, pro_ts)
-                self.update_camera_fps('LR', lr_msg)
-                self.update_camera_fps('Pro', pro_msg)
-                return lr_msg, pro_msg
-
-            lr_oldest_ts = self._msg_timestamp_seconds(self.lr_sync_buffer[0])
-            pro_oldest_ts = self._msg_timestamp_seconds(self.pro_sync_buffer[0])
-            if lr_oldest_ts <= pro_oldest_ts:
-                self.lr_sync_buffer.popleft()
-                self.sync_dropped_lr += 1
-            else:
-                self.pro_sync_buffer.popleft()
-                self.sync_dropped_pro += 1
-
-    def get_synchronized_auxiliary(self, queue, buffer, stream_name, target_ts_s, deadline=None):
-        """Consume the closest auxiliary message without reusing it in another pair."""
-        if deadline is None:
-            deadline = time.perf_counter() + self.aux_sync_wait_s
-        self._drain_queue(queue, buffer, stream_name)
-        while time.perf_counter() < deadline:
-            if buffer and self._msg_timestamp_seconds(buffer[-1]) >= target_ts_s - self.sync_tolerance_s:
-                break
-            time.sleep(0.001)
-            self._drain_queue(queue, buffer, stream_name)
-        if not buffer:
-            self.sync_aux_missing[stream_name] += 1
-            return None
-        timestamps = [self._msg_timestamp_seconds(msg) for msg in buffer]
-        best_index = int(np.argmin(np.abs(np.asarray(timestamps) - target_ts_s)))
-        best_delta = abs(timestamps[best_index] - target_ts_s)
-        if best_delta > self.sync_tolerance_s:
-            while buffer and self._msg_timestamp_seconds(buffer[0]) < target_ts_s - self.sync_tolerance_s:
-                buffer.popleft()
-                self.sync_aux_dropped[stream_name] += 1
-            self.sync_aux_missing[stream_name] += 1
-            return None
-        for _ in range(best_index):
-            buffer.popleft()
-            self.sync_aux_dropped[stream_name] += 1
-        self.sync_aux_matched[stream_name] += 1
-        return buffer.popleft()
-
     def update_camera_fps(self, camera_name, msg):
         """Calcula FPS efectivo de un stream de cámara usando timestamps de DepthAI."""
         wall_now = time.perf_counter()
@@ -1315,12 +1158,11 @@ class GazeAwareADAS:
         """Genera el reporte de validación y funcionamiento."""
         has_gaze_samples = bool(self.test_samples)
         has_alarm_data = self.total_frames_processed > 0
-        has_sync_data = self.sync_pairs_accepted > 0
-        if not has_gaze_samples and not has_alarm_data and not has_sync_data:
-            print("❌ No hay datos para generar reporte")
+        if not has_gaze_samples and not has_alarm_data:
+            print("❌ No hay datos para generar reporte (sin muestras de mirada ni eventos de alarma)")
             return
-        if not has_gaze_samples and has_sync_data:
-            print("ℹ️  Sin muestras manuales — incluyendo métricas temporales de sincronización")
+        if not has_gaze_samples:
+            print("ℹ️  Sin muestras manuales de mirada — generando reporte solo con métricas de alarma")
         
         report = {
             'timestamp': datetime.now().isoformat(),
@@ -1352,52 +1194,8 @@ class GazeAwareADAS:
                 'depth_smoothing_window': self.depth_history_length,
                 'minimum_approach_speed_mps': 0.1,
                 'ttc_threshold_s': self.ttc_threshold,
-                'cross_device_sync': 'software_nearest_timestamp',
-                'hardware_sync': False,
-                'timestamp_source': 'DepthAI getTimestamp host-aligned monotonic clock',
-                'max_pair_delta_ms': self.args.sync_tolerance_ms,
-                'sync_buffer_size': self.sync_buffer_size,
-                'auxiliary_wait_ms': self.args.aux_sync_wait_ms,
-                'frame_selection_policy': 'minimum absolute timestamp difference',
-                'unmatched_policy': 'drop oldest message',
-                'frame_reuse_or_duplication': False,
-                'temporal_extrapolation_applied': False,
-                'capture_to_decision_latency_measured': True,
             },
         }
-
-        pair_deltas = np.asarray(self.sync_pair_deltas_ms, dtype=np.float64)
-        decision_delays = np.asarray(self.capture_to_decision_latencies_ms, dtype=np.float64)
-        temporal_sync_metrics = {
-            'pairs_accepted': self.sync_pairs_accepted,
-            'lr_messages_received': self.stream_messages_received['lr'],
-            'pro_messages_received': self.stream_messages_received['pro'],
-            'lr_software_dropped': self.sync_dropped_lr,
-            'pro_software_dropped': self.sync_dropped_pro,
-            'sequence_gaps_by_stream': {
-                name: int(self.stream_sequence_gaps[name])
-                for name in ('lr', 'pro', 'lr_depth', 'pro_depth', 'face_detections')
-            },
-            'auxiliary_matched_by_stream': {
-                name: int(self.sync_aux_matched[name])
-                for name in ('lr_depth', 'pro_depth', 'face_detections')
-            },
-            'auxiliary_missing_by_stream': {
-                name: int(self.sync_aux_missing[name])
-                for name in ('lr_depth', 'pro_depth', 'face_detections')
-            },
-            'auxiliary_dropped_by_stream': {
-                name: int(self.sync_aux_dropped[name])
-                for name in ('lr_depth', 'pro_depth', 'face_detections')
-            },
-            'pair_delta_ms_mean': round(float(np.mean(pair_deltas)), 3) if pair_deltas.size else None,
-            'pair_delta_ms_max': round(float(np.max(pair_deltas)), 3) if pair_deltas.size else None,
-            'pair_delta_ms_p95': round(float(np.percentile(pair_deltas, 95)), 3) if pair_deltas.size else None,
-            'capture_to_decision_ms_mean': round(float(np.mean(decision_delays)), 3) if decision_delays.size else None,
-            'capture_to_decision_ms_max': round(float(np.max(decision_delays)), 3) if decision_delays.size else None,
-            'capture_to_decision_ms_p95': round(float(np.percentile(decision_delays, 95)), 3) if decision_delays.size else None,
-        }
-        report['temporal_synchronization'] = temporal_sync_metrics
         
         for model_name in self.model_names:
             stats = self.model_stats[model_name]
@@ -1517,17 +1315,6 @@ class GazeAwareADAS:
             print(f"   Latencia máxima: {alarm_metrics['latency_ms_max']:.1f} ms")
             print(f"   Latencia P95: {alarm_metrics['latency_ms_p95']:.1f} ms")
         print()
-
-        print("="*60)
-        print("⏱ SINCRONIZACIÓN TEMPORAL")
-        print("="*60)
-        print(f"   Pares LR/Pro aceptados: {temporal_sync_metrics['pairs_accepted']}")
-        print(f"   Desfase medio: {temporal_sync_metrics['pair_delta_ms_mean']} ms")
-        print(f"   Desfase máximo: {temporal_sync_metrics['pair_delta_ms_max']} ms")
-        print(f"   Desfase p95: {temporal_sync_metrics['pair_delta_ms_p95']} ms")
-        print(f"   Descartes LR/Pro: {temporal_sync_metrics['lr_software_dropped']}/{temporal_sync_metrics['pro_software_dropped']}")
-        print(f"   Captura a decisión, p95: {temporal_sync_metrics['capture_to_decision_ms_p95']} ms")
-        print()
         
         print("="*60)
         print("🚗 MÉTRICAS ADAS (CON VEHÍCULO EN MOVIMIENTO)")
@@ -1626,10 +1413,13 @@ class GazeAwareADAS:
                 pro_frame = None
                 face_detections = None
                 
-                # Pair the two independent devices by host-aligned acquisition time.
-                lr_data, pro_data = self.get_synchronized_primary_pair()
+                # --- T0: Captura de frame del conductor ---
+                t0_capture = time.perf_counter()
+
+                # LR frame
+                lr_data = self.lr_queue.get()
+                self.update_camera_fps('LR', lr_data)
                 lr_frame = lr_data.getCvFrame()
-                pro_frame = pro_data.getCvFrame()
                 
                 # Optical Flow + RANSAC vehicle motion detection
                 gray = cv2.cvtColor(lr_frame, cv2.COLOR_BGR2GRAY)
@@ -1676,26 +1466,21 @@ class GazeAwareADAS:
                 if self.vehicle_moving:
                     self.moving_frames_count += 1
                 
-                # Match auxiliary streams to the timestamp of their own RGB camera.
-                self._drain_queue(self.depth_queue, self.lr_depth_sync_buffer, 'lr_depth')
-                self._drain_queue(self.pro_depth_queue, self.pro_depth_sync_buffer, 'pro_depth')
-                self._drain_queue(self.face_queue, self.face_sync_buffer, 'face_detections')
-                auxiliary_deadline = time.perf_counter() + self.aux_sync_wait_s
-                depth_data = self.get_synchronized_auxiliary(
-                    self.depth_queue, self.lr_depth_sync_buffer, 'lr_depth', self.current_lr_timestamp_s,
-                    auxiliary_deadline,
-                )
-                pro_depth_data = self.get_synchronized_auxiliary(
-                    self.pro_depth_queue, self.pro_depth_sync_buffer, 'pro_depth', self.current_pro_timestamp_s,
-                    auxiliary_deadline,
-                )
-                face_data = self.get_synchronized_auxiliary(
-                    self.face_queue, self.face_sync_buffer, 'face_detections', self.current_pro_timestamp_s,
-                    auxiliary_deadline,
-                )
-                self.last_depth_frame = depth_data.getFrame() if depth_data is not None else None
-                self.last_pro_depth_frame = pro_depth_data.getFrame() if pro_depth_data is not None else None
-                if face_data is not None:
+                # Depth frame
+                depth_data = self.depth_queue.tryGet()
+                if depth_data:
+                    self.last_depth_frame = depth_data.getFrame()
+
+                # Pro frame and face detections
+                pro_data = self.pro_queue.get()
+                self.update_camera_fps('Pro', pro_data)
+                pro_frame = pro_data.getCvFrame()
+                pro_depth_data = self.pro_depth_queue.tryGet() if self.pro_depth_queue else None
+                if pro_depth_data is not None:
+                    self.last_pro_depth_frame = pro_depth_data.getFrame()
+
+                face_data = self.face_queue.tryGet()
+                if face_data:
                     face_detections = face_data.detections
                 
                 # Process face and predict gaze
@@ -1772,11 +1557,6 @@ class GazeAwareADAS:
                             else:
                                 self.current_counts = {k: 0 for k in self.current_counts}
 
-                            # Capture-to-decision delay is measured on the same host-aligned clock.
-                            capture_to_decision_ms = self._capture_to_now_ms()
-                            if capture_to_decision_ms is not None:
-                                self.capture_to_decision_latencies_ms.append(capture_to_decision_ms)
-
                             # Ejecutar Alarma Sonora si hay peligro y ha pasado el cooldown
                             self.total_frames_processed += 1
                             if danger_in_lane:
@@ -1784,8 +1564,9 @@ class GazeAwareADAS:
                                 self.alarm_active = True
                                 current_time = time.time()
                                 t3_alarm = time.perf_counter()
-                                latency_ms = capture_to_decision_ms
-                                if latency_ms is not None:
+                                latency_ms = None
+                                if self.previous_frame_input_time is not None:
+                                    latency_ms = (t3_alarm - self.previous_frame_input_time) * 1000
                                     self.pipeline_latencies.append(latency_ms)
                                 gaze_latency_ms = (t2_gaze_end - t1_gaze_start) * 1000
                                 should_beep = current_time - self.last_alarm_time > self.alarm_cooldown
@@ -1793,7 +1574,6 @@ class GazeAwareADAS:
                                     'timestamp': time.time(),
                                     'latency_total_ms': round(latency_ms, 2) if latency_ms is not None else None,
                                     'latency_gaze_ms': round(gaze_latency_ms, 2),
-                                    'lr_pro_pair_delta_ms': round(self.current_sync_delta_ms, 3),
                                     'object_missed': 'CRITICAL_LANE_OBJ',
                                     'driver_looking_at': self.current_looking_at,
                                     'beep_emitted': should_beep,
@@ -1807,7 +1587,7 @@ class GazeAwareADAS:
                                     self.alarm_trigger_count += 1
                                     
                                     # Calcular latencia total pipeline (ms)
-                                    latency_ms = self._capture_to_now_ms() or 0.0
+                                    latency_ms = (t3_alarm - self.previous_frame_input_time) * 1000 if self.previous_frame_input_time is not None else 0.0
                                     gaze_latency_ms = (t2_gaze_end - t1_gaze_start) * 1000
                                     
                                     print(f"🔔 ALARMA TTC | Peligro no visto en carril! | Conductor mira: {self.current_looking_at} | Latencia total: {latency_ms:.1f}ms")
@@ -1855,6 +1635,8 @@ class GazeAwareADAS:
                 
                 # Show frame
                 cv2.imshow("Gaze-Aware Stereo Vision ADAS", display_frame)
+                self.previous_frame_input_time = t0_capture
+
                 # Grabar frame al video
                 if is_recording and video_writer is not None:
                     video_writer.write(display_frame)
@@ -2012,20 +1794,7 @@ def parse_args():
     parser.add_argument("--save-reports", action="store_true", help="Guardar reportes JSON")
     parser.add_argument("--save-captures", action="store_true", help="Guardar imágenes que pueden contener rostros")
     parser.add_argument("--save-dataset-frames", action="store_true", help="Permitir guardar frames para YOLO")
-    parser.add_argument("--sync-tolerance-ms", type=float, default=20.0,
-                        help="Máxima diferencia temporal aceptada entre LR y Pro (ms)")
-    parser.add_argument("--sync-buffer-size", type=int, default=8,
-                        help="Número máximo de mensajes por buffer temporal")
-    parser.add_argument("--aux-sync-wait-ms", type=float, default=100.0,
-                        help="Espera máxima para profundidad y detección facial sincronizadas (ms)")
-    args = parser.parse_args()
-    if args.sync_tolerance_ms <= 0:
-        parser.error("--sync-tolerance-ms debe ser mayor que cero")
-    if args.sync_buffer_size < 2:
-        parser.error("--sync-buffer-size debe ser al menos 2")
-    if args.aux_sync_wait_ms < 0:
-        parser.error("--aux-sync-wait-ms no puede ser negativo")
-    return args
+    return parser.parse_args()
 
 
 def main():
